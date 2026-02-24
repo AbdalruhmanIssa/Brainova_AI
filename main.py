@@ -10,9 +10,10 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse,StreamingResponse
 import os, re
 import requests
+import tensorflow as tf
 
 MODEL_PATH = "model/brainova_model.keras"
-MODEL_FILE_ID = "19OrsrlSqZ-pHYWSm_QE9hyF7ykkG0Q1"
+MODEL_FILE_ID = os.getenv("MODEL_FILE_ID", "19OrsrlSqZ-pHYWSm_QE9hyF7ykkG0Q1")
 
 def download_from_drive(file_id: str, destination: str):
     os.makedirs(os.path.dirname(destination), exist_ok=True)
@@ -20,20 +21,16 @@ def download_from_drive(file_id: str, destination: str):
     session = requests.Session()
     base_url = "https://drive.google.com/uc"
 
-    # 1) First request (often returns an HTML page with confirm token)
     r = session.get(base_url, params={"export": "download", "id": file_id}, stream=True)
     r.raise_for_status()
 
-    # A) Try cookie token
     token = None
     for k, v in r.cookies.items():
         if k.startswith("download_warning"):
             token = v
             break
 
-    # B) If no cookie token, try to extract confirm token from HTML
     if token is None:
-        # If it's HTML, it will contain confirm=xxxxx somewhere
         content_type = r.headers.get("Content-Type", "")
         if "text/html" in content_type:
             html = r.text
@@ -41,26 +38,34 @@ def download_from_drive(file_id: str, destination: str):
             if m:
                 token = m.group(1)
 
-    # 2) If we found token, request again with confirm
     if token:
         r = session.get(base_url, params={"export": "download", "id": file_id, "confirm": token}, stream=True)
         r.raise_for_status()
 
-    # 3) If still HTML, permissions are not truly public
     if "text/html" in r.headers.get("Content-Type", ""):
-        raise RuntimeError("Google Drive returned HTML instead of the file (sharing/permission or confirm flow blocked).")
+        raise RuntimeError("Google Drive returned HTML instead of the file (sharing/permission blocked).")
 
-    # 4) Save file
     with open(destination, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 f.write(chunk)
+
+def ensure_model():
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
+        print("✅ Model already exists:", MODEL_PATH)
+        return
+    print("⬇️ Downloading model from Google Drive...")
+    download_from_drive(MODEL_FILE_ID, MODEL_PATH)
+    print("✅ Model downloaded:", MODEL_PATH, "size:", os.path.getsize(MODEL_PATH))
+
+ensure_model()
+
+# Load model once
+model = tf.keras.models.load_model(MODEL_PATH)
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]  # confirmed by your class_indices
 
-# ==========================
-# Load model once
-# ==========================
-model = tf.keras.models.load_model(MODEL_PATH)
+
+
 
 app = FastAPI()
 
