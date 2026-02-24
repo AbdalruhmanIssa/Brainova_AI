@@ -35,11 +35,24 @@ app = FastAPI()
 # ==========================
 def download_from_drive(file_id: str, destination: str):
     os.makedirs(os.path.dirname(destination), exist_ok=True)
-
     session = requests.Session()
-    base_url = "https://drive.google.com/uc"
 
-    r = session.get(base_url, params={"export": "download", "id": file_id}, stream=True)
+    def save_stream(resp):
+        resp.raise_for_status()
+        with open(destination, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+    # Strategy 1: Try direct uc download with confirm=t (often works for large files)
+    url1 = "https://drive.google.com/uc"
+    r = session.get(url1, params={"id": file_id, "export": "download", "confirm": "t"}, stream=True)
+    if r.status_code == 200 and "text/html" not in r.headers.get("Content-Type", ""):
+        save_stream(r)
+        return
+
+    # Strategy 2: Do the normal flow but capture token from HTML/cookies
+    r = session.get(url1, params={"id": file_id, "export": "download"}, stream=True)
     r.raise_for_status()
 
     token = None
@@ -48,29 +61,27 @@ def download_from_drive(file_id: str, destination: str):
             token = v
             break
 
-    if token is None:
-        content_type = r.headers.get("Content-Type", "")
-        if "text/html" in content_type:
-            html = r.text
-            m = re.search(r"confirm=([0-9A-Za-z_]+)", html)
-            if m:
-                token = m.group(1)
+    if token is None and "text/html" in r.headers.get("Content-Type", ""):
+        html = r.text
+        m = re.search(r'confirm=([0-9A-Za-z_]+)', html)
+        if m:
+            token = m.group(1)
 
     if token:
-        r = session.get(
-            base_url, params={"export": "download", "id": file_id, "confirm": token}, stream=True
-        )
-        r.raise_for_status()
+        r2 = session.get(url1, params={"id": file_id, "export": "download", "confirm": token}, stream=True)
+        # Sometimes Google redirects to drive.usercontent; allow it, but only if it becomes a real file
+        if r2.status_code == 200 and "text/html" not in r2.headers.get("Content-Type", ""):
+            save_stream(r2)
+            return
 
-    if "text/html" in r.headers.get("Content-Type", ""):
-        raise RuntimeError(
-            "Google Drive returned HTML instead of the file (sharing/permission blocked)."
-        )
+    # Strategy 3: Last fallback — use the "download?export=download" endpoint
+    url2 = "https://drive.google.com/uc?export=download&id=" + file_id
+    r3 = session.get(url2, stream=True)
+    if r3.status_code == 200 and "text/html" not in r3.headers.get("Content-Type", ""):
+        save_stream(r3)
+        return
 
-    with open(destination, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
+    raise RuntimeError("Failed to download model from Google Drive on this host (Drive returned HTML/404).")
 
 
 def ensure_model_file():
