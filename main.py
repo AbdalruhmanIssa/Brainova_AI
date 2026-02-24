@@ -57,11 +57,8 @@ def ensure_model():
     print("⬇️ Downloading model from Google Drive...")
     download_from_drive(MODEL_FILE_ID, MODEL_PATH)
     print("✅ Model downloaded:", MODEL_PATH, "size:", os.path.getsize(MODEL_PATH))
-
-ensure_model()
-
-# Load model once
-model = tf.keras.models.load_model(MODEL_PATH)
+print("App starting without model...")
+model = None
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]  # confirmed by your class_indices
 
 
