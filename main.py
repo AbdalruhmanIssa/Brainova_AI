@@ -1,6 +1,5 @@
 import base64
 import os
-import re
 import threading
 
 import cv2
@@ -17,10 +16,7 @@ from tensorflow.keras.preprocessing.image import img_to_array
 # Config
 # ==========================
 MODEL_PATH = "model/brainova_model.keras"
-MODEL_URL = os.getenv("MODEL_URL")  # GitHub Release direct link
-
-# Example (correct pattern):
-# https://github.com/<user>/<repo>/releases/download/<tag>/brainova_model.keras
+MODEL_URL = os.getenv("MODEL_URL")  # GitHub Release *asset* direct download link
 
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
 
@@ -34,12 +30,10 @@ app = FastAPI()
 
 
 # ==========================
-# Google Drive download (robust)
+# Helpers: Download + Validate .keras
 # ==========================
-MODEL_URL = os.getenv("MODEL_URL")  # required on Render
-
-def download_model(destination: str):
-    if not MODEL_URL:
+def download_model(url: str, destination: str):
+    if not url:
         raise RuntimeError("MODEL_URL env var is not set.")
 
     os.makedirs(os.path.dirname(destination), exist_ok=True)
@@ -50,52 +44,60 @@ def download_model(destination: str):
         "Accept": "application/octet-stream",
     }
 
-    r = requests.get(MODEL_URL, stream=True, timeout=180, allow_redirects=True, headers=headers)
+    r = requests.get(url, stream=True, timeout=300, allow_redirects=True, headers=headers)
     r.raise_for_status()
 
     ct = (r.headers.get("content-type") or "").lower()
+    # If you used a GitHub "page" link instead of a release asset link, you'll usually get HTML.
     if "text/html" in ct:
-        # This happens when you use a blob/page link instead of release asset link
-        raise RuntimeError(f"MODEL_URL returned HTML (content-type={ct}). Use the GitHub Releases *asset* URL.")
+        raise RuntimeError(
+            f"MODEL_URL returned HTML (content-type={ct}). "
+            f"Use the GitHub Releases *asset* URL (releases/download/...)."
+        )
 
     with open(tmp_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 f.write(chunk)
 
-    # atomic replace
     os.replace(tmp_path, destination)
+
+
 def validate_keras_zip(path: str):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Model file not found at {path}")
 
     size = os.path.getsize(path)
     if size < 5 * 1024 * 1024:
-        raise RuntimeError(f"Model file too small ({size} bytes). Likely HTML/failed download.")
+        raise RuntimeError(f"Model file too small ({size} bytes). Likely failed download.")
 
     with open(path, "rb") as f:
         head = f.read(4)
 
-    # .keras is a ZIP file => starts with PK
+    # .keras is a ZIP file => starts with PK\x03\x04
     if head != b"PK\x03\x04":
-        # show first bytes in hex to debug
-        raise RuntimeError(f"Not a valid .keras zip. Header bytes: {head.hex()} (wrong URL or HTML saved).")
+        raise RuntimeError(
+            f"Not a valid .keras ZIP. Header bytes: {head.hex()} "
+            f"(wrong URL or HTML saved)."
+        )
+
+
 def ensure_model_file():
+    # If it exists, validate it (maybe it was previously saved wrong)
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
-        # still validate it (in case it’s an HTML file saved earlier)
         validate_keras_zip(MODEL_PATH)
         return
 
-    print("⬇️ Downloading model from GitHub Releases MODEL_URL...")
-    download_model(MODEL_PATH)
+    print("⬇️ Downloading model from MODEL_URL ...")
+    download_model(MODEL_URL, MODEL_PATH)
     validate_keras_zip(MODEL_PATH)
-    print("✅ Model ready:", MODEL_PATH, "size:", os.path.getsize(MODEL_PATH))
+    print(f"✅ Model downloaded: {MODEL_PATH} ({os.path.getsize(MODEL_PATH)} bytes)")
 
 
 def get_model():
     """
     Lazy-load the model the first time /predict is called.
-    Keeps Render alive even if the model download fails.
+    This keeps /health working even if the model fails.
     """
     global _model, _model_ready, _model_error
 
@@ -103,18 +105,18 @@ def get_model():
         return _model
 
     with _model_lock:
-        # double-check inside lock
         if _model_ready and _model is not None:
             return _model
 
         try:
             ensure_model_file()
             print("🧠 Loading model...")
-            _model = tf.keras.models.load_model(MODEL_PATH)
+            _model = tf.keras.models.load_model(MODEL_PATH, compile=False)
             _model_ready = True
             _model_error = None
             print("✅ Model loaded successfully.")
             return _model
+
         except Exception as e:
             _model_ready = False
             _model_error = str(e)
@@ -123,15 +125,23 @@ def get_model():
 
 
 # ==========================
-# Health endpoint
+# Debug endpoints
 # ==========================
 @app.get("/health")
 def health():
     return {"ok": True, "model_ready": _model_ready, "model_error": _model_error}
 
 
+@app.get("/versions")
+def versions():
+    return {
+        "tf_version": tf.__version__,
+        "keras_version": getattr(tf.keras, "__version__", "unknown"),
+    }
+
+
 # ==========================
-# Preprocess (like your Colab intent)
+# Preprocess
 # ==========================
 def preprocess_like_colab(file_bytes: bytes):
     nparr = np.frombuffer(file_bytes, np.uint8)
@@ -140,7 +150,7 @@ def preprocess_like_colab(file_bytes: bytes):
         raise ValueError("Could not decode image. Make sure it's a valid JPG/PNG.")
 
     img_bgr = cv2.resize(img_bgr, (240, 240))
-    arr = img_to_array(img_bgr)  # float32 0..255
+    arr = img_to_array(img_bgr)  # float32 0..255 (keeps BGR order)
     return arr
 
 
@@ -182,17 +192,13 @@ def VizGradCAM_API(model, image, interpolant=0.5):
     activation_map = cv2.resize(activation_map, (original_img.shape[1], original_img.shape[0]))
     activation_map = np.maximum(activation_map, 0)
 
-    activation_map = (activation_map - activation_map.min()) / (
-        activation_map.max() - activation_map.min() + 1e-8
-    )
+    activation_map = (activation_map - activation_map.min()) / (activation_map.max() - activation_map.min() + 1e-8)
     activation_map = np.uint8(255 * activation_map)
 
     heatmap = cv2.applyColorMap(activation_map, cv2.COLORMAP_JET)
 
     original_img_norm = np.uint8(
-        (original_img - original_img.min())
-        / (original_img.max() - original_img.min() + 1e-8)
-        * 255
+        (original_img - original_img.min()) / (original_img.max() - original_img.min() + 1e-8) * 255
     )
 
     cvt_heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
@@ -211,7 +217,7 @@ async def predict(file: UploadFile = File(...)):
         contents = await file.read()
         img_arr = preprocess_like_colab(contents)
 
-        m = get_model()  # <-- lazy load here
+        m = get_model()  # lazy-load
         overlay_rgb, probs, idx = VizGradCAM_API(m, img_arr, interpolant=0.5)
 
         overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
