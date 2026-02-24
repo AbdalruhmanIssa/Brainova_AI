@@ -1,20 +1,38 @@
-import io
 import base64
+import os
+import re
+import threading
+
 import cv2
 import numpy as np
-import tensorflow as tf
-import tensorflow.keras as K
-from tensorflow.keras.models import Model
-from tensorflow.keras.preprocessing.image import img_to_array
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse,StreamingResponse
-import os, re
 import requests
 import tensorflow as tf
+import tensorflow.keras as K
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
+from tensorflow.keras.models import Model
+from tensorflow.keras.preprocessing.image import img_to_array
 
+# ==========================
+# Config
+# ==========================
 MODEL_PATH = "model/brainova_model.keras"
 MODEL_FILE_ID = os.getenv("MODEL_FILE_ID", "19OrsrlSqZ-pHYWSm_QE9hyF7ykkG0Q1")
 
+CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
+
+# Lazy model state
+_model = None
+_model_ready = False
+_model_error = None
+_model_lock = threading.Lock()
+
+app = FastAPI()
+
+
+# ==========================
+# Google Drive download (robust)
+# ==========================
 def download_from_drive(file_id: str, destination: str):
     os.makedirs(os.path.dirname(destination), exist_ok=True)
 
@@ -34,75 +52,104 @@ def download_from_drive(file_id: str, destination: str):
         content_type = r.headers.get("Content-Type", "")
         if "text/html" in content_type:
             html = r.text
-            m = re.search(r'confirm=([0-9A-Za-z_]+)', html)
+            m = re.search(r"confirm=([0-9A-Za-z_]+)", html)
             if m:
                 token = m.group(1)
 
     if token:
-        r = session.get(base_url, params={"export": "download", "id": file_id, "confirm": token}, stream=True)
+        r = session.get(
+            base_url, params={"export": "download", "id": file_id, "confirm": token}, stream=True
+        )
         r.raise_for_status()
 
     if "text/html" in r.headers.get("Content-Type", ""):
-        raise RuntimeError("Google Drive returned HTML instead of the file (sharing/permission blocked).")
+        raise RuntimeError(
+            "Google Drive returned HTML instead of the file (sharing/permission blocked)."
+        )
 
     with open(destination, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 f.write(chunk)
 
-def ensure_model():
+
+def ensure_model_file():
+    # If file exists and is > 1MB, assume it’s real (prevents partial downloads)
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
-        print("✅ Model already exists:", MODEL_PATH)
         return
+
     print("⬇️ Downloading model from Google Drive...")
     download_from_drive(MODEL_FILE_ID, MODEL_PATH)
-    print("✅ Model downloaded:", MODEL_PATH, "size:", os.path.getsize(MODEL_PATH))
-print("App starting without model...")
-model = None
-CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]  # confirmed by your class_indices
+
+    size = os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) else 0
+    print(f"✅ Model downloaded: {MODEL_PATH} ({size} bytes)")
 
 
+def get_model():
+    """
+    Lazy-load the model the first time /predict is called.
+    Keeps Render alive even if the model download fails.
+    """
+    global _model, _model_ready, _model_error
 
+    if _model_ready and _model is not None:
+        return _model
 
-app = FastAPI()
+    with _model_lock:
+        # double-check inside lock
+        if _model_ready and _model is not None:
+            return _model
+
+        try:
+            ensure_model_file()
+            print("🧠 Loading model...")
+            _model = tf.keras.models.load_model(MODEL_PATH)
+            _model_ready = True
+            _model_error = None
+            print("✅ Model loaded successfully.")
+            return _model
+        except Exception as e:
+            _model_ready = False
+            _model_error = str(e)
+            print("❌ Model load failed:", _model_error)
+            raise
 
 
 # ==========================
-# Preprocess EXACTLY like Colab:
-# cv2.imread -> BGR -> img_to_array -> float32 0..255
+# Health endpoint
+# ==========================
+@app.get("/health")
+def health():
+    return {"ok": True, "model_ready": _model_ready, "model_error": _model_error}
+
+
+# ==========================
+# Preprocess (like your Colab intent)
 # ==========================
 def preprocess_like_colab(file_bytes: bytes):
     nparr = np.frombuffer(file_bytes, np.uint8)
-    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)  # BGR, like cv2.imread
+    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)  # BGR
     if img_bgr is None:
         raise ValueError("Could not decode image. Make sure it's a valid JPG/PNG.")
 
-    # Safe resize (your model expects 240x240)
     img_bgr = cv2.resize(img_bgr, (240, 240))
-
-    # img_to_array keeps channel order (BGR here) and gives float32
-    arr = img_to_array(img_bgr)  # (240,240,3) float32, values 0..255
+    arr = img_to_array(img_bgr)  # float32 0..255
     return arr
 
 
 # ==========================
-# Your Grad-CAM (API version)
-# - removed matplotlib plotting
-# - returns overlay image + probs + label index
+# Grad-CAM
 # ==========================
 def VizGradCAM_API(model, image, interpolant=0.5):
     assert 0 < interpolant < 1, "Heatmap Interpolation Must Be Between 0 - 1"
 
-    last_conv_layer = next(
-        x for x in model.layers[::-1] if isinstance(x, K.layers.Conv2D)
-    )
+    last_conv_layer = next(x for x in model.layers[::-1] if isinstance(x, K.layers.Conv2D))
     target_layer = model.get_layer(last_conv_layer.name)
 
     original_img = image
     img = np.expand_dims(original_img, axis=0)
 
     prediction = model.predict(img, verbose=0)
-    # handle list/tuple outputs
     if isinstance(prediction, (list, tuple)):
         prediction = prediction[0]
 
@@ -125,9 +172,7 @@ def VizGradCAM_API(model, image, interpolant=0.5):
     for idx, weight in enumerate(weights):
         activation_map += float(weight) * output[:, :, idx].numpy()
 
-    activation_map = cv2.resize(
-        activation_map, (original_img.shape[1], original_img.shape[0])
-    )
+    activation_map = cv2.resize(activation_map, (original_img.shape[1], original_img.shape[0]))
     activation_map = np.maximum(activation_map, 0)
 
     activation_map = (activation_map - activation_map.min()) / (
@@ -137,7 +182,6 @@ def VizGradCAM_API(model, image, interpolant=0.5):
 
     heatmap = cv2.applyColorMap(activation_map, cv2.COLORMAP_JET)
 
-    # Same normalization style as your code
     original_img_norm = np.uint8(
         (original_img - original_img.min())
         / (original_img.max() - original_img.min() + 1e-8)
@@ -145,24 +189,24 @@ def VizGradCAM_API(model, image, interpolant=0.5):
     )
 
     cvt_heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-
-    # Overlay (same formula)
     overlay_rgb = np.uint8(original_img_norm * interpolant + cvt_heatmap * (1 - interpolant))
 
     probs = prediction[0].tolist() if prediction.ndim == 2 else prediction.tolist()
     return overlay_rgb, probs, prediction_idx
 
 
+# ==========================
+# Predict endpoint
+# ==========================
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-
         img_arr = preprocess_like_colab(contents)
 
-        overlay_rgb, probs, idx = VizGradCAM_API(model, img_arr, interpolant=0.5)
+        m = get_model()  # <-- lazy load here
+        overlay_rgb, probs, idx = VizGradCAM_API(m, img_arr, interpolant=0.5)
 
-        # Encode overlay as JPG base64
         overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
         ok, buf = cv2.imencode(".jpg", overlay_bgr)
         if not ok:
@@ -173,7 +217,7 @@ async def predict(file: UploadFile = File(...)):
         return {
             "label": CLASS_NAMES[idx],
             "probabilities": probs,
-            "gradcam_image_base64": overlay_b64
+            "gradcam_image_base64": overlay_b64,
         }
 
     except Exception as e:
