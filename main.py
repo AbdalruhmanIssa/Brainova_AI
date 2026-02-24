@@ -33,16 +33,20 @@ app = FastAPI()
 # ==========================
 # Google Drive download (robust)
 # ==========================
-def download_from_drive(file_id: str, destination: str):
-    os.makedirs(os.path.dirname(destination), exist_ok=True)
-    session = requests.Session()
+MODEL_URL = os.getenv("MODEL_URL")  # required on Render
 
-    def save_stream(resp):
-        resp.raise_for_status()
-        with open(destination, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
+def download_model(destination: str):
+    if not MODEL_URL:
+        raise RuntimeError("MODEL_URL env var is not set")
+
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    r = requests.get(MODEL_URL, stream=True, timeout=120)
+    r.raise_for_status()
+
+    with open(destination, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
 
     # Strategy 1: Try direct uc download with confirm=t (often works for large files)
     url1 = "https://drive.google.com/uc"
@@ -85,15 +89,28 @@ def download_from_drive(file_id: str, destination: str):
 
 
 def ensure_model_file():
-    # If file exists and is > 1MB, assume it’s real (prevents partial downloads)
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
         return
 
-    print("⬇️ Downloading model from Google Drive...")
-    download_from_drive(MODEL_FILE_ID, MODEL_PATH)
+    if not MODEL_URL:
+        raise RuntimeError("MODEL_URL env var is not set (host the .keras on GitHub Releases or HuggingFace).")
 
-    size = os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) else 0
-    print(f"✅ Model downloaded: {MODEL_PATH} ({size} bytes)")
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+
+    tmp_path = MODEL_PATH + ".tmp"
+    headers = {"User-Agent": "brainova-ai/1.0"}
+
+    print("⬇️ Downloading model from MODEL_URL...")
+    r = requests.get(MODEL_URL, stream=True, timeout=180, headers=headers)
+    r.raise_for_status()
+
+    with open(tmp_path, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+
+    os.replace(tmp_path, MODEL_PATH)  # atomic rename
+    print("✅ Model downloaded:", MODEL_PATH, "size:", os.path.getsize(MODEL_PATH))
 
 
 def get_model():
