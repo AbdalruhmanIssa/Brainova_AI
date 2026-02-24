@@ -17,7 +17,10 @@ from tensorflow.keras.preprocessing.image import img_to_array
 # Config
 # ==========================
 MODEL_PATH = "model/brainova_model.keras"
-MODEL_FILE_ID = os.getenv("MODEL_FILE_ID", "19OrsrlSqZ-pHYWSm_QE9hyF7ykkG0Q1")
+MODEL_URL = os.getenv("MODEL_URL")  # GitHub Release direct link
+
+# Example (correct pattern):
+# https://github.com/<user>/<repo>/releases/download/<tag>/brainova_model.keras
 
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
 
@@ -37,80 +40,56 @@ MODEL_URL = os.getenv("MODEL_URL")  # required on Render
 
 def download_model(destination: str):
     if not MODEL_URL:
-        raise RuntimeError("MODEL_URL env var is not set")
+        raise RuntimeError("MODEL_URL env var is not set.")
 
     os.makedirs(os.path.dirname(destination), exist_ok=True)
-    r = requests.get(MODEL_URL, stream=True, timeout=120)
+    tmp_path = destination + ".tmp"
+
+    headers = {
+        "User-Agent": "brainova-ai/1.0",
+        "Accept": "application/octet-stream",
+    }
+
+    r = requests.get(MODEL_URL, stream=True, timeout=180, allow_redirects=True, headers=headers)
     r.raise_for_status()
 
-    with open(destination, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-
-    # Strategy 1: Try direct uc download with confirm=t (often works for large files)
-    url1 = "https://drive.google.com/uc"
-    r = session.get(url1, params={"id": file_id, "export": "download", "confirm": "t"}, stream=True)
-    if r.status_code == 200 and "text/html" not in r.headers.get("Content-Type", ""):
-        save_stream(r)
-        return
-
-    # Strategy 2: Do the normal flow but capture token from HTML/cookies
-    r = session.get(url1, params={"id": file_id, "export": "download"}, stream=True)
-    r.raise_for_status()
-
-    token = None
-    for k, v in r.cookies.items():
-        if k.startswith("download_warning"):
-            token = v
-            break
-
-    if token is None and "text/html" in r.headers.get("Content-Type", ""):
-        html = r.text
-        m = re.search(r'confirm=([0-9A-Za-z_]+)', html)
-        if m:
-            token = m.group(1)
-
-    if token:
-        r2 = session.get(url1, params={"id": file_id, "export": "download", "confirm": token}, stream=True)
-        # Sometimes Google redirects to drive.usercontent; allow it, but only if it becomes a real file
-        if r2.status_code == 200 and "text/html" not in r2.headers.get("Content-Type", ""):
-            save_stream(r2)
-            return
-
-    # Strategy 3: Last fallback — use the "download?export=download" endpoint
-    url2 = "https://drive.google.com/uc?export=download&id=" + file_id
-    r3 = session.get(url2, stream=True)
-    if r3.status_code == 200 and "text/html" not in r3.headers.get("Content-Type", ""):
-        save_stream(r3)
-        return
-
-    raise RuntimeError("Failed to download model from Google Drive on this host (Drive returned HTML/404).")
-
-
-def ensure_model_file():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
-        return
-
-    if not MODEL_URL:
-        raise RuntimeError("MODEL_URL env var is not set (host the .keras on GitHub Releases or HuggingFace).")
-
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-
-    tmp_path = MODEL_PATH + ".tmp"
-    headers = {"User-Agent": "brainova-ai/1.0"}
-
-    print("⬇️ Downloading model from MODEL_URL...")
-    r = requests.get(MODEL_URL, stream=True, timeout=180, headers=headers)
-    r.raise_for_status()
+    ct = (r.headers.get("content-type") or "").lower()
+    if "text/html" in ct:
+        # This happens when you use a blob/page link instead of release asset link
+        raise RuntimeError(f"MODEL_URL returned HTML (content-type={ct}). Use the GitHub Releases *asset* URL.")
 
     with open(tmp_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=1024 * 1024):
             if chunk:
                 f.write(chunk)
 
-    os.replace(tmp_path, MODEL_PATH)  # atomic rename
-    print("✅ Model downloaded:", MODEL_PATH, "size:", os.path.getsize(MODEL_PATH))
+    # atomic replace
+    os.replace(tmp_path, destination)
+def validate_keras_zip(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model file not found at {path}")
+
+    size = os.path.getsize(path)
+    if size < 5 * 1024 * 1024:
+        raise RuntimeError(f"Model file too small ({size} bytes). Likely HTML/failed download.")
+
+    with open(path, "rb") as f:
+        head = f.read(4)
+
+    # .keras is a ZIP file => starts with PK
+    if head != b"PK\x03\x04":
+        # show first bytes in hex to debug
+        raise RuntimeError(f"Not a valid .keras zip. Header bytes: {head.hex()} (wrong URL or HTML saved).")
+def ensure_model_file():
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
+        # still validate it (in case it’s an HTML file saved earlier)
+        validate_keras_zip(MODEL_PATH)
+        return
+
+    print("⬇️ Downloading model from GitHub Releases MODEL_URL...")
+    download_model(MODEL_PATH)
+    validate_keras_zip(MODEL_PATH)
+    print("✅ Model ready:", MODEL_PATH, "size:", os.path.getsize(MODEL_PATH))
 
 
 def get_model():
