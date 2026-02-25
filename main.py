@@ -83,16 +83,7 @@ def validate_keras_zip(path: str):
         )
 
 
-def ensure_model_file():
-    # If it exists, validate it (maybe it was previously saved wrong)
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
-        validate_keras_zip(MODEL_PATH)
-        return
 
-    print("⬇️ Downloading model from MODEL_URL ...")
-    download_model(MODEL_URL, MODEL_PATH)
-    validate_keras_zip(MODEL_PATH)
-    print(f"✅ Model downloaded: {MODEL_PATH} ({os.path.getsize(MODEL_PATH)} bytes)")
 
 
 def get_model():
