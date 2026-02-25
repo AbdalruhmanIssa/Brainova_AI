@@ -11,12 +11,14 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from tensorflow.keras.models import Model
 from tensorflow.keras.preprocessing.image import img_to_array
+from google.cloud import storage
 
 # ==========================
 # Config
 # ==========================
-MODEL_PATH = "model/brainova_model.keras"
-MODEL_URL = os.getenv("MODEL_URL")  # GitHub Release *asset* direct download link
+MODEL_PATH = "/tmp/brainova_model.keras"
+MODEL_GCS_URI = os.getenv("MODEL_GCS_URI")  # gs://bucket/brainova_model.keras
+
 
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
 
@@ -32,36 +34,35 @@ app = FastAPI()
 # ==========================
 # Helpers: Download + Validate .keras
 # ==========================
-def download_model(url: str, destination: str):
-    if not url:
-        raise RuntimeError("MODEL_URL env var is not set.")
+
+
+def download_model_from_gcs(gcs_uri: str, destination: str):
+    if not gcs_uri or not gcs_uri.startswith("gs://"):
+        raise RuntimeError("MODEL_GCS_URI must be set like: gs://bucket/object")
+
+    # parse gs://bucket/object
+    no_scheme = gcs_uri.replace("gs://", "", 1)
+    bucket_name, blob_name = no_scheme.split("/", 1)
 
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     tmp_path = destination + ".tmp"
 
-    headers = {
-        "User-Agent": "brainova-ai/1.0",
-        "Accept": "application/octet-stream",
-    }
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
 
-    r = requests.get(url, stream=True, timeout=300, allow_redirects=True, headers=headers)
-    r.raise_for_status()
-
-    ct = (r.headers.get("content-type") or "").lower()
-    # If you used a GitHub "page" link instead of a release asset link, you'll usually get HTML.
-    if "text/html" in ct:
-        raise RuntimeError(
-            f"MODEL_URL returned HTML (content-type={ct}). "
-            f"Use the GitHub Releases *asset* URL (releases/download/...)."
-        )
-
-    with open(tmp_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-
+    blob.download_to_filename(tmp_path)
     os.replace(tmp_path, destination)
 
+def ensure_model_file():
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
+        validate_keras_zip(MODEL_PATH)
+        return
+
+    print("⬇️ Downloading model from GCS ...")
+    download_model_from_gcs(MODEL_GCS_URI, MODEL_PATH)
+    validate_keras_zip(MODEL_PATH)
+    print(f"✅ Model downloaded: {MODEL_PATH} ({os.path.getsize(MODEL_PATH)} bytes)")
 
 def validate_keras_zip(path: str):
     if not os.path.exists(path):
