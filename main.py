@@ -144,7 +144,71 @@ def preprocess_like_colab(file_bytes: bytes):
     img_bgr = cv2.resize(img_bgr, (240, 240))
     arr = img_to_array(img_bgr)  # float32 0..255 (keeps BGR order)
     return arr
+def decode_image(file_bytes: bytes):
+    nparr = np.frombuffer(file_bytes, np.uint8)
+    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("Could not decode image. Make sure it's a valid JPG/PNG.")
+    return img_bgr
 
+
+def preprocess_like_colab_from_bgr(img_bgr: np.ndarray):
+    img_bgr = cv2.resize(img_bgr, (240, 240))
+    arr = img_to_array(img_bgr)  # float32 0..255 (keeps BGR order)
+    return arr
+
+
+def validate_brain_mri_like(img_bgr: np.ndarray):
+    h, w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    if h < 128 or w < 128:
+        return False, "Image too small for MRI.", {}
+
+    # MRI images are usually close to grayscale
+    b, g, r = cv2.split(img_bgr.astype(np.float32))
+    colorfulness = np.mean(np.abs(r - g) + np.abs(g - b) + np.abs(r - b))
+    if colorfulness > 25:
+        return False, "Image is too colorful to be a brain MRI.", {
+            "colorfulness": float(colorfulness)
+        }
+
+    # MRI scans usually have dark background around the head
+    border = 20
+    border_pixels = np.concatenate([
+        gray[:border, :].flatten(),
+        gray[-border:, :].flatten(),
+        gray[:, :border].flatten(),
+        gray[:, -border:].flatten()
+    ])
+    dark_ratio = np.mean(border_pixels < 40)
+    if dark_ratio < 0.5:
+        return False, "Missing MRI-style dark background.", {
+            "dark_ratio": float(dark_ratio)
+        }
+
+    # Detect main object area
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(thresh)
+    if num_labels <= 1:
+        return False, "No brain-like region detected.", {}
+
+    largest_idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    area = stats[largest_idx, cv2.CC_STAT_AREA]
+    area_ratio = area / float(h * w)
+
+    if area_ratio < 0.2 or area_ratio > 0.75:
+        return False, "Object does not match MRI proportions.", {
+            "area_ratio": float(area_ratio)
+        }
+
+    return True, "Looks like MRI", {
+        "colorfulness": float(colorfulness),
+        "dark_ratio": float(dark_ratio),
+        "area_ratio": float(area_ratio)
+    }
 
 # ==========================
 # Grad-CAM
@@ -207,22 +271,49 @@ def VizGradCAM_API(model, image, interpolant=0.5):
 async def predict(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        img_arr = preprocess_like_colab(contents)
 
-        m = get_model()  # lazy-load
+        allowed_types = {"image/jpeg", "image/png", "image/jpg"}
+        if file.content_type not in allowed_types:
+            return JSONResponse(
+                {"success": False, "message": "Only JPG and PNG images are allowed."},
+                status_code=400
+            )
+
+        img_bgr = decode_image(contents)
+
+        is_valid, reason, debug = validate_brain_mri_like(img_bgr)
+        if not is_valid:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "message": reason,
+                    "validation": debug
+                },
+                status_code=400
+            )
+
+        img_arr = preprocess_like_colab_from_bgr(img_bgr)
+
+        m = get_model()  # lazy-load stays the same
         overlay_rgb, probs, idx = VizGradCAM_API(m, img_arr, interpolant=0.5)
 
         overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
         ok, buf = cv2.imencode(".jpg", overlay_bgr)
         if not ok:
-            return JSONResponse({"success": False, "message": "Failed to encode overlay"}, status_code=500)
+            return JSONResponse(
+                {"success": False, "message": "Failed to encode overlay"},
+                status_code=500
+            )
 
         overlay_b64 = base64.b64encode(buf).decode("utf-8")
 
         return {
+            "success": True,
+            "message": "Prediction completed successfully.",
             "label": CLASS_NAMES[idx],
             "probabilities": probs,
             "gradcam_image_base64": overlay_b64,
+            "validation": debug
         }
 
     except Exception as e:
