@@ -199,10 +199,7 @@ def validate_brain_mri_like(img_bgr: np.ndarray):
     area = stats[largest_idx, cv2.CC_STAT_AREA]
     area_ratio = area / float(h * w)
 
-    if area_ratio < 0.2 or area_ratio > 0.75:
-        return False, "Object does not match MRI proportions.", {
-            "area_ratio": float(area_ratio)
-        }
+    
 
     return True, "Looks like MRI", {
         "colorfulness": float(colorfulness),
