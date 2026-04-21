@@ -208,6 +208,7 @@ def validate_brain_mri_like(img_bgr: np.ndarray):
         }
 
     # MRI scans usually have dark background around the head
+    """
     border = 20
     border_pixels = np.concatenate([
         gray[:border, :].flatten(),
@@ -221,6 +222,7 @@ def validate_brain_mri_like(img_bgr: np.ndarray):
         return False, "Missing MRI-style dark background.", {
             "dark_ratio": float(dark_ratio)
         }
+        """
 
     # Detect main object area
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -237,7 +239,7 @@ def validate_brain_mri_like(img_bgr: np.ndarray):
 
     return True, "Looks like MRI", {
         "colorfulness": float(colorfulness),
-        "dark_ratio": float(dark_ratio),
+     #   "dark_ratio": float(dark_ratio),
         "area_ratio": float(area_ratio)
     }
 
