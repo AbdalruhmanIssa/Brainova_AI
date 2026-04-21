@@ -271,14 +271,21 @@ def _get_last_feature_map_layer(model):
     return next(x for x in model.layers[::-1] if isinstance(x, K.layers.Conv2D))
 
 
-def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5):
+def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5, skip_classes=()):
     """
     Grad-CAM over the last spatial feature map. Both inputs are RGB:
       display_rgb      : (H,W,3) uint8    — image the heatmap is drawn on
       model_input_rgb  : (H,W,3) float32  — tensor fed to the model
+      skip_classes     : iterable of class indices for which Grad-CAM
+                         should be skipped entirely. Used for 'notumor':
+                         the model classifies that case by ABSENCE of
+                         tumor features, so there's nothing positive
+                         for Grad-CAM to highlight, and the result is
+                         a misleading dead-blue overlay.
     Returns (overlay_rgb, probs, prediction_idx, heatmap_available).
     """
     assert 0 < interpolant < 1, "Heatmap interpolation must be between 0 and 1"
+    skip_classes = set(skip_classes)
 
     target_layer = _get_last_feature_map_layer(model)
 
@@ -300,6 +307,21 @@ def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5):
     if isinstance(prediction, (list, tuple)):
         prediction = prediction[0]
     prediction_idx = int(np.argmax(prediction))
+
+    # Short-circuit for classes where Grad-CAM is meaningless (e.g. notumor).
+    # Render a flat "cold" overlay (uniform JET-zero blue blended with the
+    # MRI) so the result is visually consistent with normal heatmap output
+    # but clearly conveys "no positive evidence found".
+    if prediction_idx in skip_classes:
+        probs = prediction[0].tolist() if prediction.ndim == 2 else prediction.tolist()
+        flat = np.zeros((display_rgb.shape[0], display_rgb.shape[1]), dtype=np.uint8)
+        cold_bgr = cv2.applyColorMap(flat, cv2.COLORMAP_JET)
+        cold_rgb = cv2.cvtColor(cold_bgr, cv2.COLOR_BGR2RGB)
+        flat_overlay = np.uint8(
+            display_rgb.astype(np.float32) * interpolant
+            + cold_rgb.astype(np.float32) * (1 - interpolant)
+        )
+        return flat_overlay, probs, prediction_idx, False
 
     if last_dense is not None:
         gradient_model = Model(
@@ -391,8 +413,12 @@ async def predict(file: UploadFile = File(...)):
         display_rgb, model_input_rgb = preprocess_for_model(img_bgr)
 
         m = get_model()  # lazy-load stays the same
+        # Skip Grad-CAM for "notumor" — there are no positive features
+        # to highlight, so the heatmap collapses into a misleading blue.
+        skip = {CLASS_NAMES.index("notumor")} if "notumor" in CLASS_NAMES else set()
         overlay_rgb, probs, idx, heatmap_available = VizGradCAM_API(
-            m, display_rgb, model_input_rgb, interpolant=0.5
+            m, display_rgb, model_input_rgb, interpolant=0.5,
+            skip_classes=skip,
         )
 
         overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
