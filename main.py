@@ -207,23 +207,6 @@ def validate_brain_mri_like(img_bgr: np.ndarray):
             "colorfulness": float(colorfulness)
         }
 
-    # MRI scans usually have dark background around the head
-    """
-    border = 20
-    border_pixels = np.concatenate([
-        gray[:border, :].flatten(),
-        gray[-border:, :].flatten(),
-        gray[:, :border].flatten(),
-        gray[:, -border:].flatten()
-    ])
-    dark_ratio = np.mean(border_pixels < 40)
-
-    if dark_ratio < 0.5:
-        return False, "Missing MRI-style dark background.", {
-            "dark_ratio": float(dark_ratio)
-        }
-        """
-
     # Detect main object area
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -239,7 +222,6 @@ def validate_brain_mri_like(img_bgr: np.ndarray):
 
     return True, "Looks like MRI", {
         "colorfulness": float(colorfulness),
-     #   "dark_ratio": float(dark_ratio),
         "area_ratio": float(area_ratio)
     }
 
@@ -251,16 +233,15 @@ def _get_last_feature_map_layer(model):
     """
     Return the last layer whose output is a 4D feature map (N, H, W, C).
 
-    This is the correct Grad-CAM target — not the last Conv2D. In
-    EfficientNet the last Conv2D is 'top_conv', whose output is
-    pre-BatchNorm and pre-swish. Those raw values can be uniformly
-    negative for the class-relevant channels, so after the ReLU step
-    in Grad-CAM the whole heatmap collapses to zero and the JET
-    colormap renders as solid dark blue.
+    For EfficientNetB1 this resolves to 'top_activation' (post-BN,
+    post-swish). Using the deepest 4D layer maximises class-
+    discriminativeness — the heatmap highlights tumor-class features,
+    not generic edges or textures that earlier layers respond to.
 
-    For EfficientNet the layer we want is 'top_activation'
-    (post-BN, post-swish), whose features are non-negative and
-    behave well for Grad-CAM.
+    Spatial coarseness (8x8 for this model) is handled by the
+    Grad-CAM++ weighting in VizGradCAM_API, which concentrates the
+    activation on the strongest positive-gradient locations instead
+    of averaging over the whole feature map.
     """
     for layer in reversed(model.layers):
         try:
@@ -269,11 +250,11 @@ def _get_last_feature_map_layer(model):
             continue
         if shape is not None and len(shape) == 4:
             return layer
-    # Fallback — shouldn't happen in practice.
     return next(x for x in model.layers[::-1] if isinstance(x, K.layers.Conv2D))
 
 
-def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5, skip_classes=()):
+def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5,
+                   skip_classes=(), override_probs=None):
     """
     Grad-CAM over the last spatial feature map. Both inputs are RGB:
       display_rgb      : (H,W,3) uint8    — image the heatmap is drawn on
@@ -284,6 +265,16 @@ def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5, skip_cl
                          tumor features, so there's nothing positive
                          for Grad-CAM to highlight, and the result is
                          a misleading dead-blue overlay.
+      override_probs   : optional precomputed softmax probabilities to
+                         use in place of model.predict() inside this
+                         function. Used for Test-Time Augmentation: the
+                         caller runs the model on original+flipped
+                         inputs, averages the softmax outputs, and
+                         passes the averaged vector in here. Grad-CAM
+                         itself still runs on the ORIGINAL (unflipped)
+                         input, so the heatmap stays anatomically
+                         correct while the classification benefits from
+                         TTA stability.
     Returns (overlay_rgb, probs, prediction_idx, heatmap_available).
     """
     assert 0 < interpolant < 1, "Heatmap interpolation must be between 0 and 1"
@@ -305,9 +296,15 @@ def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5, skip_cl
 
     img = np.expand_dims(model_input_rgb, axis=0)
 
-    prediction = model.predict(img, verbose=0)
-    if isinstance(prediction, (list, tuple)):
-        prediction = prediction[0]
+    if override_probs is not None:
+        # TTA path: use the caller's pre-averaged softmax vector.
+        prediction = np.asarray(override_probs, dtype=np.float32)
+        if prediction.ndim == 1:
+            prediction = prediction[np.newaxis, :]
+    else:
+        prediction = model.predict(img, verbose=0)
+        if isinstance(prediction, (list, tuple)):
+            prediction = prediction[0]
     prediction_idx = int(np.argmax(prediction))
 
     # Short-circuit for classes where Grad-CAM is meaningless (e.g. notumor).
@@ -345,17 +342,49 @@ def VizGradCAM_API(model, display_rgb, model_input_rgb, interpolant=0.5, skip_cl
 
     gradients = tape.gradient(loss, conv2d_out)
 
-    output = conv2d_out[0]
-    weights = tf.reduce_mean(gradients[0], axis=(0, 1))
+    # ---- HiResCAM / Layer-CAM weighting ----
+    # Grad-CAM and Grad-CAM++ both aggregate gradients across space to
+    # produce per-channel SCALAR weights, then multiply each channel's
+    # full activation map by that scalar. That channel-level step
+    # blurs spatial detail — two pixels in the same channel get the
+    # same weight regardless of where they fall, so the heatmap peak
+    # drifts toward the channel's spatial center of mass.
+    #
+    # HiResCAM / Layer-CAM skips channel-level aggregation entirely.
+    # Each pixel's contribution is computed directly from its own
+    # gradient and activation at that exact location:
+    #
+    #   cam_ij = ReLU( sum_k ReLU(grads_ij,k) * A_ij,k )
+    #
+    # No averaging across space. Preserves the spatial detail that
+    # earlier CAM variants lose. For small or off-center tumors, the
+    # pixels that contribute are exactly those where gradient AND
+    # activation are both positive at the tumor location — the heatmap
+    # locks onto that region instead of spreading out or drifting.
+    A = conv2d_out[0]                                              # (H, W, C)
+    dY = gradients[0]                                              # (H, W, C)
 
-    activation_map = np.zeros(output.shape[0:2], dtype=np.float32)
-    for idx, weight in enumerate(weights):
-        activation_map += float(weight) * output[:, :, idx].numpy()
+    relu_grads = tf.maximum(dY, 0.0)                               # (H, W, C)
+    activation_map = tf.reduce_sum(relu_grads * A, axis=-1)        # (H, W)
+    activation_map = tf.maximum(activation_map, 0.0).numpy().astype(np.float32)
 
     activation_map = cv2.resize(
         activation_map, (display_rgb.shape[1], display_rgb.shape[0])
     )
     activation_map = np.maximum(activation_map, 0)
+
+    # HiResCAM's per-pixel weighting produces a very tight peak —
+    # correct location, but often only covers the center of a tumor
+    # rather than its full extent. A mild Gaussian blur widens the
+    # warm region around the peak without moving it, so the heatmap
+    # visually covers the tumor instead of just marking its middle.
+    # sigma scales with image size so coverage stays consistent across
+    # different input resolutions. Bump the divisor (30 → 20) for
+    # wider spread, lower it (30 → 40) for a tighter peak.
+    blur_sigma = max(2.0, display_rgb.shape[0] / 30.0)
+    activation_map = cv2.GaussianBlur(
+        activation_map, (0, 0), sigmaX=blur_sigma, sigmaY=blur_sigma
+    )
 
     amap_max = float(activation_map.max())
     probs = prediction[0].tolist() if prediction.ndim == 2 else prediction.tolist()
@@ -415,12 +444,26 @@ async def predict(file: UploadFile = File(...)):
         display_rgb, model_input_rgb = preprocess_for_model(img_bgr)
 
         m = get_model()  # lazy-load stays the same
+
+        # Test-Time Augmentation: run the model on the original AND a
+        # horizontally-flipped copy, then average the softmax outputs.
+        # Training used horizontal_flip=True augmentation, so the model
+        # is flip-invariant by design. Averaging two views pulls the
+        # final prediction toward the consistent class signal and away
+        # from noise — in particular, this helps ring-enhancing glioma
+        # cases that a single-view pass sometimes mis-routes to notumor.
+        img_batch = np.expand_dims(model_input_rgb, axis=0)
+        img_flip = img_batch[:, :, ::-1, :]
+        probs_orig = m.predict(img_batch, verbose=0)[0]
+        probs_flip = m.predict(img_flip, verbose=0)[0]
+        probs_tta = (probs_orig + probs_flip) / 2.0
+
         # Skip Grad-CAM for "notumor" — there are no positive features
         # to highlight, so the heatmap collapses into a misleading blue.
         skip = {CLASS_NAMES.index("notumor")} if "notumor" in CLASS_NAMES else set()
         overlay_rgb, probs, idx, heatmap_available = VizGradCAM_API(
             m, display_rgb, model_input_rgb, interpolant=0.5,
-            skip_classes=skip,
+            skip_classes=skip, override_probs=probs_tta,
         )
 
         overlay_bgr = cv2.cvtColor(overlay_rgb, cv2.COLOR_RGB2BGR)
