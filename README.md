@@ -2,7 +2,7 @@
 
 Brainova AI is a deep-learning microservice that classifies brain-MRI images into one of four categories — **glioma**, **meningioma**, **no-tumor**, or **pituitary** — and returns an explainable **Grad-CAM heatmap** highlighting the region that drove the decision.
 
-It is built with **FastAPI**, runs a **TensorFlow / EfficientNet** model, and is deployed as a serverless container on **Google Cloud Run**.
+It is built with **FastAPI**, runs a **TensorFlow / EfficientNet** model, and is deployed as a containerized service on **Google Cloud Run**.
 
 > ⚠️ **Medical disclaimer:** This is a decision-support and educational tool, **not** a substitute for a qualified radiologist. Predictions should always be reviewed by a medical professional.
 
@@ -71,14 +71,14 @@ The frontend never calls this service directly. The ASP.NET backend receives the
 
 **Why a separate microservice?** The ML stack (TensorFlow, OpenCV, the model weights) is heavy and Python-based. Isolating it lets the main backend stay lightweight, lets the AI component scale independently on Cloud Run, and keeps ML dependencies decoupled from the rest of the app.
 
-**Model loading.** In the Cloud Run deployment, the model is **not** bundled inside the container image. On the first prediction request it is downloaded from Google Cloud Storage into `/tmp`, validated, and cached in memory (lazy loading). This keeps the container image small and startup fast, and lets the `/health` endpoint respond even before the model is loaded.
+**Model loading.** The model is **not** bundled inside the container image. On the first prediction request it is downloaded from Google Cloud Storage (via the `MODEL_GCS_URI` environment variable) into `/tmp`, validated as a real `.keras` archive, and cached in memory (lazy loading). This keeps the container image small and startup fast, and lets the `/health` endpoint respond even before the model is loaded. A thread lock ensures the model is loaded only once even under concurrent requests.
 
 ---
 
 ## How prediction works (step by step)
 
 1. **Receive** — image arrives at `POST /predict`.
-2. **Check file type** — only `image/jpeg` and `image/png` are accepted.
+2. **Check file type** — only `image/jpeg`, `image/jpg`, and `image/png` are accepted.
 3. **Decode** — bytes → image array via OpenCV.
 4. **Validate MRI-likeness** — size, colorfulness, and presence of a brain-like region.
 5. **Preprocess** — crop the brain region, resize to 240×240, convert BGR→RGB.
@@ -128,7 +128,7 @@ curl -X POST \
 Lightweight liveness/readiness check. Returns whether the service is up and whether the model has loaded — without triggering a prediction.
 
 ```json
-{ "ok": true, "model_ready": true, "model_error": null }
+{ "ok": true, "model_ready": false, "model_error": null }
 ```
 
 ### `GET /versions`
@@ -143,11 +143,12 @@ Returns the TensorFlow and Keras versions the service is running (useful for deb
 |---|---|
 | Web framework | FastAPI |
 | ASGI server | Uvicorn |
-| ML framework | TensorFlow 2.15 (CPU) / Keras |
+| ML framework | TensorFlow 2.20 / Keras |
 | Model architecture | EfficientNet (transfer learning) |
 | Image processing | OpenCV (headless), Pillow, NumPy |
 | Explainability | Grad-CAM (HiRes/Layer-CAM variant) |
-| Model storage | Google Cloud Storage |
+| Model storage | Google Cloud Storage (`google-cloud-storage`) |
+| Containerization | Docker (`python:3.11-slim` base) |
 | Hosting | Google Cloud Run (serverless containers) |
 | Runtime | Python 3.11 |
 
@@ -157,23 +158,25 @@ Returns the TensorFlow and Keras versions the service is running (useful for deb
 
 ```
 Brainova_AI/
-├── main.py                          # FastAPI app (local-model variant: /health, /predict)
-├── main_cloudrun_fullpic.py         # Cloud Run variant — GCS model download + full-picture Grad-CAM
-├── requirements.txt                 # Python dependencies
-├── runtime.txt                      # Python version pin (3.11.9)
-├── copy_of_graduation_clean.ipynb   # Training / experimentation notebook
-├── EXPLANATION_main_cloudrun_fullpic.md   # Deep-dive walkthrough of the service
-├── DEFENSE_SUMMARY_cloudrun_fullpic.md    # Plain-language summary & FAQ
-└── model/                           # Model weights (git-ignored; served from GCS in prod)
+├── main.py            # FastAPI app: /health, /versions, /predict
+│                      #   - lazy-downloads the model from GCS
+│                      #   - MRI validation, crop + resize preprocessing
+│                      #   - EfficientNet inference with 2-view TTA
+│                      #   - full-picture Grad-CAM overlay
+├── Dockerfile         # Container build (python:3.11-slim, uvicorn on $PORT)
+├── .dockerignore      # Excludes venv, caches, and model weights from the image
+├── requirements.txt   # Python dependencies
+├── runtime.txt        # Python version pin (3.11.9)
+└── README.md
 ```
 
-Note: the `model/` directory and `*.keras` / `*.h5` / `*.onnx` weights are intentionally **git-ignored** — they are large and, in production, streamed from Google Cloud Storage instead of committed to the repo.
+The model weights (`*.keras`) are intentionally **not** in the repo — they are large and are streamed from Google Cloud Storage at runtime (see [Model loading](#architecture)). `.dockerignore` also keeps them out of the container image.
 
 ---
 
 ## Running locally
 
-Requires **Python 3.11**.
+Requires **Python 3.11** and access to a GCS bucket holding `brainova_model.keras` (the service loads the model from GCS, not from disk).
 
 ```bash
 # 1. Clone
@@ -187,34 +190,38 @@ source venv/bin/activate        # Windows: venv\Scripts\activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Provide the model
-#    Place brainova_model.keras under model/  (local variant),
-#    or set MODEL_GCS_URI for the Cloud Run variant (see below).
+# 4. Authenticate to Google Cloud (so the app can read the model from GCS)
+gcloud auth application-default login
 
-# 5. Run the API
+# 5. Point the app at your model and run
+export MODEL_GCS_URI="gs://<your-bucket>/brainova_model.keras"
 uvicorn main:app --reload --host 0.0.0.0 --port 8080
 ```
 
 Then open http://localhost:8080/docs for the interactive Swagger UI.
 
-To run the Cloud Run variant locally instead:
+### Run with Docker
 
 ```bash
-export MODEL_GCS_URI="gs://<your-bucket>/brainova_model.keras"
-uvicorn main_cloudrun_fullpic:app --reload --port 8080
+docker build -t brainova-ai .
+docker run -p 8080:8080 \
+  -e PORT=8080 \
+  -e MODEL_GCS_URI="gs://<your-bucket>/brainova_model.keras" \
+  -v $HOME/.config/gcloud:/root/.config/gcloud \
+  brainova-ai
 ```
 
 ---
 
 ## Deploying to Cloud Run
 
-The production service runs the Cloud Run variant, which downloads the model from Cloud Storage at runtime.
+The production service is built from the included `Dockerfile` and deployed to Cloud Run in `europe-west1`.
 
 ```bash
 # 1. Upload the model to a GCS bucket
 gsutil cp brainova_model.keras gs://<your-bucket>/brainova_model.keras
 
-# 2. Deploy from source
+# 2. Deploy from source (Cloud Run builds the Dockerfile automatically)
 gcloud run deploy brainova-ai \
   --source . \
   --region europe-west1 \
@@ -223,7 +230,7 @@ gcloud run deploy brainova-ai \
   --set-env-vars MODEL_GCS_URI="gs://<your-bucket>/brainova_model.keras"
 ```
 
-The container's service account needs **read** access to the bucket. Cloud Run's writable disk is `/tmp`, which is where the model is cached after download.
+The container's service account needs **read** access to the bucket. Cloud Run injects the `PORT` env var (the `Dockerfile` binds uvicorn to it), and its writable disk is `/tmp`, where the model is cached after download.
 
 ---
 
@@ -238,7 +245,7 @@ Key training details (mirrored exactly at inference time so input matches traini
 - **EfficientNet backbone** — transfer learning with a built-in rescaling layer (inputs stay in the 0–255 range rather than being manually normalized).
 - **4-class softmax head** — outputs one probability per tumor class.
 
-The full pipeline — data loading, augmentation, model definition, training loop, and evaluation — lives in the [Colab notebook](https://colab.research.google.com/drive/1zL-2A7jRuvODVOPz61kRNEKX1aACmbQH?usp=sharing) and in `copy_of_graduation_clean.ipynb`.
+The full pipeline — data loading, augmentation, model definition, training loop, and evaluation — lives in the [Colab notebook](https://colab.research.google.com/drive/1zL-2A7jRuvODVOPz61kRNEKX1aACmbQH?usp=sharing).
 
 ---
 
@@ -272,5 +279,3 @@ Developed as a graduation project by the Brainova team.
 
 - Dataset: Masoud Nickparvar — [Brain Tumor MRI Dataset](https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset) (Kaggle).
 - Built with FastAPI, TensorFlow, OpenCV, and Google Cloud Run.
-
-For a plain-language walkthrough and defense-style FAQ, see `DEFENSE_SUMMARY_cloudrun_fullpic.md`; for a deep technical dive, see `EXPLANATION_main_cloudrun_fullpic.md`.
