@@ -12,7 +12,7 @@ It is built with **FastAPI**, runs a **TensorFlow / EfficientNet** model, and is
 
 | Resource | Link |
 |---|---|
-| **Live API (interactive Swagger docs)** | https://brainova-ai-1031567223264.europe-west1.run.app/docs |
+| **Live API (interactive Swagger docs)** | https://brainova-ai-1031567223264.europe-west1.run.app/docs <br> https://brainova-ai.bravewater-b9761655.westeurope.azurecontainerapps.io/docs|
 | **Model training notebook (Google Colab)** | https://colab.research.google.com/drive/1zL-2A7jRuvODVOPz61kRNEKX1aACmbQH?usp=sharing |
 | **Dataset (Kaggle — Brain Tumor MRI Dataset)** | https://www.kaggle.com/datasets/masoudnickparvar/brain-tumor-mri-dataset |
 
