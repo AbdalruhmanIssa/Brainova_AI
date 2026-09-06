@@ -9,13 +9,19 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from tensorflow.keras.models import Model
 from tensorflow.keras.preprocessing.image import img_to_array
-from google.cloud import storage
 
 # ==========================
 # Config
 # ==========================
-MODEL_PATH = "/tmp/brainova_model.keras"
-MODEL_GCS_URI = os.getenv("MODEL_GCS_URI")  # gs://bucket/brainova_model.keras
+MODEL_PATH = os.getenv("MODEL_CACHE_PATH", "/tmp/brainova_model.keras")
+
+# Option A (recommended) - blob URL + the container app's managed identity:
+#   https://<account>.blob.core.windows.net/models/brainova_model.keras
+MODEL_BLOB_URL = os.getenv("MODEL_BLOB_URL")
+
+# Option B (fallback) - the same URL with a SAS token appended. No Azure auth
+# needed, but the token expires. Handy for a quick local test.
+MODEL_SAS_URL = os.getenv("MODEL_SAS_URL")
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
 INPUT_SIZE = (240, 240)  # (W, H) — must match training
 
@@ -29,19 +35,39 @@ app = FastAPI()
 
 
 # ==========================
-# Helpers: Download + Validate .keras
+# Helpers: Download from Azure Blob Storage + Validate .keras
 # ==========================
-def download_model_from_gcs(gcs_uri: str, destination: str):
-    if not gcs_uri or not gcs_uri.startswith("gs://"):
-        raise RuntimeError("MODEL_GCS_URI must be set like: gs://bucket/object")
-    no_scheme = gcs_uri.replace("gs://", "", 1)
-    bucket_name, blob_name = no_scheme.split("/", 1)
+def download_model_from_azure(destination: str):
+    """
+    Download the .keras model from Azure Blob Storage into `destination`.
+
+    Writes to a .tmp file first and only renames on success, so a half-finished
+    download can never be mistaken for a valid cached model.
+    """
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     tmp_path = destination + ".tmp"
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.download_to_filename(tmp_path)
+
+    if MODEL_SAS_URL:
+        import requests
+        with requests.get(MODEL_SAS_URL, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                    f.write(chunk)
+    elif MODEL_BLOB_URL:
+        from azure.identity import DefaultAzureCredential
+        from azure.storage.blob import BlobClient
+        blob = BlobClient.from_blob_url(
+            MODEL_BLOB_URL, credential=DefaultAzureCredential()
+        )
+        with open(tmp_path, "wb") as f:
+            blob.download_blob(max_concurrency=4).readinto(f)
+    else:
+        raise RuntimeError(
+            "No model source configured. Set MODEL_BLOB_URL (managed identity) "
+            "or MODEL_SAS_URL (SAS token)."
+        )
+
     os.replace(tmp_path, destination)
 
 
@@ -49,8 +75,8 @@ def ensure_model_file():
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024 * 1024:
         validate_keras_zip(MODEL_PATH)
         return
-    print("⬇️ Downloading model from GCS ...")
-    download_model_from_gcs(MODEL_GCS_URI, MODEL_PATH)
+    print("⬇️ Downloading model from Azure Blob Storage ...")
+    download_model_from_azure(MODEL_PATH)
     validate_keras_zip(MODEL_PATH)
     print(f"✅ Model downloaded: {MODEL_PATH} ({os.path.getsize(MODEL_PATH)} bytes)")
 
