@@ -1,6 +1,18 @@
 __pycache__/
 venv/
+.venv/
 .git/
 *.pyc
+
+# model weights - streamed from Azure Blob Storage at runtime
 model/
 *.keras
+*.h5
+*.onnx
+
+# keep the build context small
+*.ipynb
+*.md
+*.pptx
+*.docx
+*.pdf
